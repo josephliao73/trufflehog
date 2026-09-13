@@ -25,9 +25,14 @@ jobs:
       # When the tag is the same across PRs, build-previous hits cache.
       # When a new release tag is pushed, the file changes → cache miss → rebuild.
       - name: Resolve previous tag
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git fetch --tags
-          git tag -l --sort=-v:refname | head -n 1 > .peak-previous-tag
+          gh release list \
+            --repo trufflesecurity/trufflehog \
+            --limit 1 \
+            --json tagName \
+            --jq '.[0].tagName' > .peak-previous-tag
           echo "Previous tag: $(cat .peak-previous-tag)"
 
       - name: Clone peak
