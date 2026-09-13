@@ -1,0 +1,117 @@
+name: Performance Test (Peak)
+
+on: [pull_request]
+
+jobs:
+  speed:
+    if: ${{ ! github.event.pull_request.head.repo.fork }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref }}
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache: true
+
+      # Write previous tag to a file so Peak can use it as a cache input.
+      # When the tag is the same across PRs, build-previous hits cache.
+      # When a new release tag is pushed, the file changes → cache miss → rebuild.
+      - name: Resolve previous tag
+        run: |
+          git fetch --tags
+          git tag -l --sort=-v:refname | head -n 1 > .peak-previous-tag
+          echo "Previous tag: $(cat .peak-previous-tag)"
+
+      - name: Clone peak
+        env:
+          PEAK_REPO: ${{ vars.PEAK_REPO || 'https://github.com/josephliao73/cache-test' }}
+          PEAK_REF:  ${{ vars.PEAK_REF  || 'main' }}
+        run: git clone --depth 1 --branch "$PEAK_REF" "$PEAK_REPO" /tmp/peak
+
+      - name: Cache peak binary
+        id: peak-bin-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/peak/target/release/peak
+          key: peak-binary-${{ runner.os }}-${{ hashFiles('/tmp/peak/Cargo.lock') }}
+
+      - name: Set up Rust
+        if: steps.peak-bin-cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Compile peak
+        if: steps.peak-bin-cache.outputs.cache-hit != 'true'
+        run: cd /tmp/peak && cargo build --release
+
+      - name: Install peak
+        run: sudo cp /tmp/peak/target/release/peak /usr/local/bin/peak
+
+      # Restore the Peak task cache. Key includes the previous tag so a new
+      # release invalidates the previous-binary entry while preserving the
+      # testdata clone entry (which never changes).
+      - name: Restore Peak cache
+        uses: actions/cache@v4
+        with:
+          path: .peak-cache
+          key: peak-perf-${{ runner.os }}-${{ hashFiles('.peak-previous-tag') }}
+          restore-keys: peak-perf-${{ runner.os }}-
+
+      # Runs clone-testdata and build-previous, skipping either if cached.
+      - name: Setup benchmark fixtures via Peak
+        run: peak run
+
+      # Build HEAD binary — changes every PR, not worth caching.
+      - name: Build HEAD binary
+        run: go build -o current .
+
+      # Run benchmark: HEAD vs previous, 5 runs each, on the cached testdata.
+      - name: Benchmark HEAD
+        run: |
+          user_time_sum=0
+          for i in {1..5}; do
+            tmpfile=$(mktemp)
+            /usr/bin/time -o "$tmpfile" ./current filesystem trufflehog-testdata \
+              --no-verification --no-update > /dev/null
+            user_time=$(awk '{print $1}' "$tmpfile" | sed 's/user//')
+            rm "$tmpfile"
+            user_time_sum=$(echo "$user_time_sum + $user_time" | bc)
+          done
+          echo "HEAD_TIME=$(echo "scale=3; $user_time_sum / 5" | bc)" >> "$GITHUB_ENV"
+
+      - name: Benchmark previous
+        run: |
+          user_time_sum=0
+          for i in {1..5}; do
+            tmpfile=$(mktemp)
+            /usr/bin/time -o "$tmpfile" ./previous filesystem trufflehog-testdata \
+              --no-verification --no-update > /dev/null
+            user_time=$(awk '{print $1}' "$tmpfile" | sed 's/user//')
+            rm "$tmpfile"
+            user_time_sum=$(echo "$user_time_sum + $user_time" | bc)
+          done
+          echo "PREVIOUS_TIME=$(echo "scale=3; $user_time_sum / 5" | bc)" >> "$GITHUB_ENV"
+
+      - name: Compare results
+        run: |
+          PREV_TAG=$(cat .peak-previous-tag)
+          echo "HEAD    ($GITHUB_SHA) avg time (n=5): ${HEAD_TIME}s"
+          echo "Previous ($PREV_TAG)  avg time (n=5): ${PREVIOUS_TIME}s"
+          if [ "$(echo "$HEAD_TIME > $PREVIOUS_TIME * 1.5" | bc)" -eq 1 ]; then
+            echo "FAIL: HEAD is more than 50% slower than $PREV_TAG"
+            exit 1
+          fi
+          echo "OK: within acceptable range"
+
+      - name: Peak cache stats
+        if: always()
+        run: |
+          if [ -d .peak-cache ]; then
+            echo "Cache size: $(du -sh .peak-cache | cut -f1)"
+            find .peak-cache -name SUCCESS | wc -l | xargs -I{} echo "Cached entries: {}"
+          fi

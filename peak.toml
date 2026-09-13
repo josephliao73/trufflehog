@@ -1,0 +1,23 @@
+# Peak task cache for the performance benchmark.
+#
+# Two tasks are cached — everything else (HEAD build, benchmark timing) is
+# inherently per-PR or non-deterministic and is left to run normally.
+#
+# build-previous: The previous release binary is identical across all PRs
+#   until a new tag is pushed. .peak-previous-tag holds the tag name; when it
+#   changes, Peak misses and rebuilds. Between releases this is a constant
+#   cache hit, saving ~60-90s of Go compilation per PR.
+#
+# clone-testdata: The test target is hardcoded to v3.75.1. Its input hash is
+#   constant (just the command string), so it always hits after the first run.
+
+[tasks.clone-testdata]
+command = "bash scripts/peak-clone-testdata.sh"
+inputs  = []
+outputs = ["trufflehog-testdata/"]
+
+[tasks.build-previous]
+command    = "bash scripts/peak-build-previous.sh"
+inputs     = [".peak-previous-tag"]
+outputs    = ["previous"]
+depends_on = ["clone-testdata"]
